@@ -2,13 +2,15 @@ version 1.0
 
 workflow DMRNAseq {
 	input {
-        Array[File] ubams
+        Array[File] input_bams
         Array[String] sample_ids
 
         String project_id
 
         File annotation_gff
 		File ref_fasta
+
+        Boolean unaligned = true
 
         Int htseq_minMAPQ = 10
         String htseq_mode = "union"
@@ -21,27 +23,29 @@ workflow DMRNAseq {
         Int threadCount = 32
 	}
 
-    scatter (i in range(length(ubams))) {
-        call samtools_fastq {
-            input:
-                ubam = ubams[i],
-                sample_id = sample_ids[i],
-                memSizeGB = memSizeGB,
-                threadCount = threadCount
-        }
+    scatter (i in range(length(input_bams))) {
+        if (unaligned) {
+            call samtools_fastq {
+                input:
+                    ubam = input_bams[i],
+                    sample_id = sample_ids[i],
+                    memSizeGB = memSizeGB,
+                    threadCount = threadCount
+            }
 
-        call minimap2_rna_alignment {
-            input:
-                reads_fastq = samtools_fastq[i].reads_fastq,
-                ref_fasta = ref_fasta,
-                sample_id = sample_ids[i],
-                memSizeGB = memSizeGB,
-                threadCount = threadCount
-        }
+            call minimap2_rna_alignment {
+                input:
+                    fastq = samtools_fastq.fastq,
+                    ref_fasta = ref_fasta,
+                    sample_id = sample_ids[i],
+                    memSizeGB = memSizeGB,
+                    threadCount = threadCount
+            }
+        } 
 
         call samtools_sort_index {
             input:
-                ubam = minimap2_rna_alignment[i].aligned_sam,
+                sam = select_first([minimap2_rna_alignment.aligned_sam, input_bams[i]]),
                 ref_fasta = ref_fasta,
                 sample_id = sample_ids[i],
                 memSizeGB = memSizeGB,
@@ -50,7 +54,7 @@ workflow DMRNAseq {
 
         call nanoplot_qc {
             input:
-                aligned_bam = samtools_sort_index[i].sorted_bam, 
+                bam = samtools_sort_index.sorted_bam, 
                 sample_id = sample_ids[i],
                 memSizeGB = memSizeGB,
                 threadCount = threadCount
@@ -75,6 +79,8 @@ workflow DMRNAseq {
 	output {
         File htseq_count_matrix = HTSeq_count.htseq_count_matrix
         Array[File] htseq_tagged_bams = HTSeq_count.htseq_tagged_bams
+
+        Array[File] nanoplot_gzips = nanoplot_qc.nanoplot_gzip
 	}
 
 	meta {
@@ -124,7 +130,7 @@ task samtools_fastq {
 
 task minimap2_rna_alignment {
 	input {
-		File reads_fastq
+		File fastq
 		File ref_fasta
 		String sample_id
 
@@ -133,7 +139,7 @@ task minimap2_rna_alignment {
 	}
 
     # Estimate disk size required
-	Int input_fastq_size = ceil(size(reads_fastq, "GB"))       
+	Int input_fastq_size = ceil(size(fastq, "GB"))       
 	Int final_disk_dize = input_fastq_size * 10
 
 	# set outputs as wdl variables
@@ -152,7 +158,7 @@ task minimap2_rna_alignment {
             -N 20 \
             --junc-bed ${anno_bed} \
             -I 16G \
-            ~{ref_fasta} ~{reads_fastq} > ~{aligned_sam_output}
+            ~{ref_fasta} ~{fastq} > ~{aligned_sam_output}
 	>>>
 
 	output {
@@ -170,7 +176,7 @@ task minimap2_rna_alignment {
 
 task samtools_sort_index {
 	input {
-		File aligned_sam
+		File sam
         File ref_fasta
 		String sample_id
 
@@ -179,21 +185,25 @@ task samtools_sort_index {
 	}
 
     # Estimate disk size required
-	Int input_sam_size = ceil(size(aligned_sam, "GB"))       
+	Int input_sam_size = ceil(size(sam, "GB"))       
 	Int final_disk_dize = input_sam_size * 10
 
 	# set outputs as wdl variables
 	String sorted_bam_output = "~{sample_id}_minimap2.bam"
+    String sorted_bai_output = "~{sample_id}_minimap2.bam.bai"
 
 	command <<<
         set -eux -o pipefail
 
-        samtools view -@ ~{threadCount} -bh -T ~{ref_fasta} ~{aligned_sam} | \
+        samtools view -@ ~{threadCount} -bh -T ~{ref_fasta} ~{sam} | \
 			samtools sort -@ ~{threadCount} - > ~{sorted_bam_output}
+
+        samtools index -@ ~{threadCount} ~{sorted_bam_output}
 	>>>
 
 	output {
 		File sorted_bam = sorted_bam_output
+        File sorted_bai = sorted_bai_output
 	}
 
 	runtime {
@@ -207,7 +217,7 @@ task samtools_sort_index {
 
 task nanoplot_qc {
 	input {
-		File sorted_bam
+		File bam
 		String sample_id
 
         Int memSizeGB
@@ -215,7 +225,7 @@ task nanoplot_qc {
 	}
 
     # Estimate disk size required
-	Int input_bam_size = ceil(size(sorted_bam, "GB"))       
+	Int input_bam_size = ceil(size(bam, "GB"))       
 	Int final_disk_dize = input_bam_size * 10
 
 	# set outputs as wdl variables
@@ -237,7 +247,7 @@ task nanoplot_qc {
             --plots dot \
             --N50 \
             --dpi 1200 \
-            --bam ~{sorted_bam}
+            --bam ~{bam}
 
         gzip -c ~{nanoplot_folder_output} > ~{nanoplot_gzip_output}
 	>>>
@@ -261,7 +271,7 @@ task HTSeq_count {
         File annotation_gff
         String project_id
 
-        Int minMAPQ
+        Int htseq_minMAPQ
         String htseq_mode
         String htseq_nonunique 
         String htseq_feature_type
@@ -276,8 +286,11 @@ task HTSeq_count {
 	Int input_bam_size = ceil(size(sorted_bams, "GB"))       
 	Int final_disk_dize = input_bam_size * 10
 
+    # set inputs as wdl variables
+    String sorted_bams_string_input = sep(" ", sorted_bams)
+
 	# set outputs as wdl variables
-    String htseq_tagged_bams_output = sep(" ", map(f >= basename(f, ".bam") + "_htseq.sam", sorted_bams))
+    String htseq_tagged_bams_output = sub(sorted_bams_string_input, "\\.bam$","_htseq.sam")
     String htseq_count_matrix_output = "~{project_id}_htseq_count_matrix.tsv"
 
 	command <<<
@@ -287,7 +300,7 @@ task HTSeq_count {
             --format=bam \
             --order=pos \
             --nprocesses=~{threadCount} \
-            --a=~{minMAPQ} \
+            --a=~{htseq_minMAPQ} \
             --mode=~{htseq_mode}
             --nonunique=~{htseq_nonunique} \
             --type=~{htseq_feature_type} \
@@ -295,7 +308,7 @@ task HTSeq_count {
             ~{htseq_additional_flags} \
             --samout=~{htseq_tagged_bams_output} \
             --counts_output=~{htseq_count_matrix_output} \
-            ~{sorted_bams} ~{annotation_gff} # FIX SORTED BAMS
+            ~{sorted_bams_string_input} ~{annotation_gff} # FIX SORTED BAMS
 	>>>
 
 	output {
